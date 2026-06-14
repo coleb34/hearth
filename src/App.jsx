@@ -1,9 +1,10 @@
 import { useState, useEffect, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import {
   LayoutDashboard, Receipt, Target, Landmark, Wallet, Database,
   Upload, Download, Plus, Trash2, Pencil, X, Check, AlertTriangle,
   TrendingUp, TrendingDown, PiggyBank, Flame, ChevronRight, Info, Sparkles,
-  LogIn, LogOut, Cloud, CloudOff, Loader2, ShieldCheck
+  LogIn, LogOut, Cloud, CloudOff, Loader2, ShieldCheck, FileText, KeyRound
 } from "lucide-react";
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
@@ -11,6 +12,7 @@ import {
 } from "recharts";
 import Papa from "papaparse";
 import { supabase } from "./supabase.js";
+import { parseStatementText } from "./chaseParse.js";
 
 /* ============================================================ THEME */
 const FONT_LINKS = (
@@ -100,9 +102,9 @@ tr:last-child td{border-bottom:none}
 .inp{font-family:inherit;font-size:13.5px;padding:8px 11px;border:1px solid var(--line2);border-radius:10px;background:#fff;color:var(--ink);width:100%}
 .inp:focus{outline:none;border-color:var(--green2);box-shadow:0 0 0 3px rgba(46,107,82,.12)}
 select.inp{cursor:pointer}
-.modal-bg{position:fixed;inset:0;background:rgba(26,38,32,.42);backdrop-filter:blur(3px);z-index:50;display:grid;place-items:center;padding:18px}
+.modal-bg{position:fixed;inset:0;background:rgba(26,38,32,.42);backdrop-filter:blur(3px);z-index:50;display:flex;align-items:center;justify-content:center;padding:18px;overflow-y:auto}
 .modal{background:var(--surface);border-radius:18px;border:1px solid var(--line);box-shadow:0 30px 60px -20px rgba(26,38,32,.4);
-  width:100%;max-width:560px;max-height:88vh;overflow:auto}
+  width:100%;max-width:560px;max-height:88vh;overflow:auto;margin:auto}
 .empty{text-align:center;padding:54px 20px;color:var(--muted)}
 .empty .ic{width:54px;height:54px;border-radius:15px;background:var(--bg2);display:grid;place-items:center;margin:0 auto 14px;color:var(--green2)}
 .legend{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:12px}
@@ -144,6 +146,8 @@ const RULES = [
   { re: /psychedelic|mindmed|maps\b/i, flow: "income", g: "Income — Practice", c: "Research contract" },
   // specific payees (override generic payment-method rules below)
   { re: /kam gentry|gentry/i, flow: "expense", g: "Practice / Business", c: "Office rent", biz: "Business" },
+  { re: /payment thank you|card payment received|automatic payment - thank/i, flow: "transfer", g: "Transfers & Savings", c: "Card payment (transfer)" },
+  { re: /interest charge/i, flow: "expense", g: "Debt service", c: "Card interest" },
   { re: /square\s*inc|sq\*?\d|squareup/i, flow: "auto", g: "Income — Practice", c: "Square (card payments)", expG: "Practice / Business", expC: "Square fee" },
   { re: /venmo/i, flow: "auto", g: "Income — Other", c: "Venmo in", expG: "Payments to Individuals", expC: "Venmo out" },
   { re: /paypal/i, flow: "auto", g: "Income — Other", c: "PayPal in", expG: "Shopping & Retail", expC: "PayPal purchase" },
@@ -393,8 +397,17 @@ function ProgressBar({ value, color = "#3E8E6E" }) {
   return <div className="bar-track"><div className="bar-fill" style={{ width: w + "%", background: color }} /></div>;
 }
 function Modal({ title, onClose, children }) {
-  return (
-    <div className="modal-bg" onClick={onClose}>
+  // Rendered in a portal at <body> so it always centers on the VIEWPORT —
+  // never lost mid-page in a long transactions list — with background scroll locked.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => { document.body.style.overflow = prev; window.removeEventListener("keydown", onKey); };
+  }, [onClose]);
+  return createPortal(
+    <div className="modal-bg" onClick={onClose} role="dialog" aria-modal="true">
       <div className="modal fade" onClick={(e) => e.stopPropagation()}>
         <div className="spread pad" style={{ borderBottom: "1px solid var(--line)", position: "sticky", top: 0, background: "var(--surface)", zIndex: 2 }}>
           <h3 className="serif" style={{ margin: 0, fontSize: 19, fontWeight: 600 }}>{title}</h3>
@@ -402,7 +415,8 @@ function Modal({ title, onClose, children }) {
         </div>
         <div className="pad">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -561,10 +575,14 @@ function AppShell({ session, localOnly, household, onHouseholdChange }) {
 /* ============================================================ AUTH WRAPPER */
 export default function App() {
   const [session, setSession] = useState(undefined);
+  const [recovery, setRecovery] = useState(false);
   useEffect(() => {
     if (!hasCloud) { setSession(null); return; }
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
+      if (event === "PASSWORD_RECOVERY") setRecovery(true);   // user arrived via a reset-email link
+      setSession(s);
+    });
     return () => sub.subscription.unsubscribe();
   }, []);
 
@@ -572,6 +590,7 @@ export default function App() {
   if (!hasCloud) content = <AppShell localOnly />;
   else if (session === undefined) content = <Splash />;
   else if (!session) content = <AuthScreen />;
+  else if (recovery) content = <ResetPasswordScreen onDone={() => setRecovery(false)} />;
   else content = <CloudGate session={session} key={session.user.id} />;
 
   return (<>{FONT_LINKS}<style>{CSS}</style>{content}</>);
@@ -671,10 +690,14 @@ function AuthScreen() {
   const [ok, setOk] = useState(null);
 
   const submit = async () => {
-    if (busy || !email || !pw) return;
+    if (busy || !email || (mode !== "forgot" && !pw)) return;
     setBusy(true); setMsg(null); setOk(null);
     try {
-      if (mode === "signup") {
+      if (mode === "forgot") {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+        if (error) setMsg(error.message);
+        else setOk("Reset link sent — check your email, then follow the link back here to choose a new password.");
+      } else if (mode === "signup") {
         const { data, error } = await supabase.auth.signUp({ email, password: pw });
         if (error) setMsg(error.message);
         else if (!data.session) setOk("Account created — check your email to confirm, then sign in.");
@@ -692,24 +715,65 @@ function AuthScreen() {
         <div className="pad" style={{ textAlign: "center", borderBottom: "1px solid var(--line)" }}>
           <div className="mark" style={{ margin: "0 auto 12px", width: 46, height: 46 }}><PiggyBank size={24} /></div>
           <h1 className="serif" style={{ margin: 0, fontSize: 25, fontWeight: 600 }}>Hearth</h1>
-          <div className="note" style={{ marginTop: 5 }}>{mode === "signin" ? "Sign in to your household finances" : "Create your account"}</div>
+          <div className="note" style={{ marginTop: 5 }}>{mode === "signin" ? "Sign in to your household finances" : mode === "signup" ? "Create your account" : "Reset your password"}</div>
         </div>
         <div className="pad">
-          <Field label="Email"><input className="inp" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" /></Field>
-          <div style={{ height: 11 }} />
-          <Field label="Password"><input className="inp" type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"} value={pw} onChange={(e) => setPw(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="••••••••" /></Field>
+          <Field label="Email"><input className="inp" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && mode === "forgot") submit(); }} placeholder="you@example.com" /></Field>
+          {mode !== "forgot" && <>
+            <div style={{ height: 11 }} />
+            <Field label="Password"><input className="inp" type="password" autoComplete={mode === "signup" ? "new-password" : "current-password"} value={pw} onChange={(e) => setPw(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="••••••••" /></Field>
+          </>}
           {msg && <div className="banner warn" style={{ marginTop: 12 }}><AlertTriangle size={15} style={{ flex: "none", marginTop: 1 }} /><span>{msg}</span></div>}
           {ok && <div className="banner info" style={{ marginTop: 12 }}><Check size={15} style={{ flex: "none", marginTop: 1 }} /><span>{ok}</span></div>}
-          <button className="btn primary" onClick={submit} disabled={busy || !email || !pw} style={{ width: "100%", justifyContent: "center", marginTop: 14 }}>
-            {busy ? <><Loader2 size={15} className="spin" /> Working…</> : mode === "signin" ? <><LogIn size={15} /> Sign in</> : <><ShieldCheck size={15} /> Create account</>}
+          <button className="btn primary" onClick={submit} disabled={busy || !email || (mode !== "forgot" && !pw)} style={{ width: "100%", justifyContent: "center", marginTop: 14 }}>
+            {busy ? <><Loader2 size={15} className="spin" /> Working…</> : mode === "signin" ? <><LogIn size={15} /> Sign in</> : mode === "signup" ? <><ShieldCheck size={15} /> Create account</> : <><KeyRound size={15} /> Send reset link</>}
           </button>
           <div className="note" style={{ textAlign: "center", marginTop: 14 }}>
-            {mode === "signin" ? "No account yet? " : "Already have one? "}
+            {mode === "signin" ? "No account yet? " : "Back to "}
             <button className="btn ghost sm" style={{ display: "inline-flex" }} onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setMsg(null); setOk(null); }}>{mode === "signin" ? "Create one" : "Sign in"}</button>
+            {mode === "signin" && <> · <button className="btn ghost sm" style={{ display: "inline-flex" }} onClick={() => { setMode("forgot"); setMsg(null); setOk(null); }}>Forgot password?</button></>}
           </div>
         </div>
         <div className="pad" style={{ borderTop: "1px solid var(--line)", background: "var(--bg2)", borderBottomLeftRadius: 16, borderBottomRightRadius: 16 }}>
           <div className="note" style={{ display: "flex", gap: 8, alignItems: "flex-start" }}><ShieldCheck size={14} style={{ flex: "none", marginTop: 1, color: "var(--green2)" }} /><span>Protected by row-level security — only your account can read your data, and it's encrypted in transit.</span></div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ResetPasswordScreen({ onDone }) {
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const submit = async () => {
+    if (busy) return;
+    if (pw.length < 6) { setMsg("Password must be at least 6 characters."); return; }
+    if (pw !== pw2) { setMsg("Passwords don't match."); return; }
+    setBusy(true); setMsg(null);
+    try {
+      const { error } = await supabase.auth.updateUser({ password: pw });
+      if (error) { setMsg(error.message); setBusy(false); return; }
+      onDone();
+    } catch (e) { setMsg(String(e?.message || e)); setBusy(false); }
+  };
+  return (
+    <div className="bapp" style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 18 }}>
+      <div className="card fade" style={{ width: "100%", maxWidth: 400 }}>
+        <div className="pad" style={{ textAlign: "center", borderBottom: "1px solid var(--line)" }}>
+          <div className="mark" style={{ margin: "0 auto 12px", width: 46, height: 46 }}><KeyRound size={22} /></div>
+          <h1 className="serif" style={{ margin: 0, fontSize: 24, fontWeight: 600 }}>Choose a new password</h1>
+          <div className="note" style={{ marginTop: 5 }}>You followed a reset link — set your new password below.</div>
+        </div>
+        <div className="pad">
+          <Field label="New password"><input className="inp" type="password" autoComplete="new-password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="••••••••" /></Field>
+          <div style={{ height: 11 }} />
+          <Field label="Confirm new password"><input className="inp" type="password" autoComplete="new-password" value={pw2} onChange={(e) => setPw2(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") submit(); }} placeholder="••••••••" /></Field>
+          {msg && <div className="banner warn" style={{ marginTop: 12 }}><AlertTriangle size={15} style={{ flex: "none", marginTop: 1 }} /><span>{msg}</span></div>}
+          <button className="btn primary" onClick={submit} disabled={busy || !pw || !pw2} style={{ width: "100%", justifyContent: "center", marginTop: 14 }}>
+            {busy ? <><Loader2 size={15} className="spin" /> Saving…</> : <><Check size={15} /> Set new password</>}
+          </button>
         </div>
       </div>
     </div>
@@ -885,6 +949,7 @@ function EmptyDash() {
 /* ============================================================ TRANSACTIONS */
 function Transactions({ state, addTxns, updateTxn, delTxn, applyCategorization }) {
   const [importing, setImporting] = useState(false);
+  const [notice, setNotice] = useState("");
   const [adding, setAdding] = useState(false);
   const [categorizing, setCategorizing] = useState(null);
   const [fGroup, setFGroup] = useState("all");
@@ -905,12 +970,14 @@ function Transactions({ state, addTxns, updateTxn, delTxn, applyCategorization }
   return (
     <div className="fade">
       <div className="section-h">
-        <div><h2 className="serif">Transactions</h2><p>{state.transactions.length} total. Import bank CSVs, fix any category, and the rest of the app updates instantly.</p></div>
+        <div><h2 className="serif">Transactions</h2><p>{state.transactions.length} total. Import bank CSVs or Chase statement PDFs, fix any category, and the rest of the app updates instantly.</p></div>
         <div className="row">
           <button className="btn" onClick={() => setAdding(true)}><Plus size={15} /> Add</button>
           <button className="btn primary" onClick={() => setImporting(true)}><Upload size={15} /> Import CSV</button>
         </div>
       </div>
+
+      {notice && <div className="banner info" style={{ marginBottom: 14 }}><Check size={16} style={{ flex: "none", marginTop: 1 }} /><span style={{ flex: 1 }}>{notice}</span><button className="btn ghost sm" onClick={() => setNotice("")}><X size={14} /></button></div>}
 
       <Card className="pad" style={{ marginBottom: 14 }}>
         <div className="row" style={{ flexWrap: "wrap", gap: 10 }}>
@@ -943,7 +1010,7 @@ function Transactions({ state, addTxns, updateTxn, delTxn, applyCategorization }
         )}
       </Card>
 
-      {importing && <ImportModal state={state} addTxns={addTxns} onClose={() => setImporting(false)} />}
+      {importing && <ImportModal state={state} addTxns={addTxns} onClose={() => setImporting(false)} onDone={(n) => { setImporting(false); setNotice(`Imported ${n} transaction${n === 1 ? "" : "s"}.`); window.scrollTo({ top: 0, behavior: "smooth" }); }} />}
       {adding && <AddTxnModal state={state} addTxns={addTxns} onClose={() => setAdding(false)} />}
       {categorizing && <CategorizeModal txn={categorizing} state={state} onApply={applyCategorization} onClose={() => setCategorizing(null)} />}
     </div>
@@ -1068,7 +1135,7 @@ function CategorizeModal({ txn, state, onApply, onClose }) {
 }
 
 /* ---------- CSV IMPORT ---------- */
-function ImportModal({ state, addTxns, onClose }) {
+function ImportModal({ state, addTxns, onClose, onDone }) {
   const [raw, setRaw] = useState(null);
   const [headers, setHeaders] = useState([]);
   const [map, setMap] = useState({ date: "", desc: "", amount: "", debit: "", credit: "" });
@@ -1076,11 +1143,25 @@ function ImportModal({ state, addTxns, onClose }) {
   const [flipSign, setFlipSign] = useState(false);
   const [acct, setAcct] = useState(state.accounts[0]);
   const [preview, setPreview] = useState([]);
+  const [pdfRows, setPdfRows] = useState(null);
+  const [pdfMeta, setPdfMeta] = useState(null);
+  const [parsing, setParsing] = useState(false);
+  const [errMsg, setErrMsg] = useState("");
   const fileRef = useRef(null);
 
+  const ingestStatementText = (text) => {
+    const res = parseStatementText(text);
+    if (!res.rows.length) { setErrMsg("Couldn't find transactions in that statement. If it's a scanned/image PDF, try the CSV download from your bank's website instead."); return false; }
+    setPdfRows(res.rows); setPdfMeta(res.meta); setErrMsg("");
+    return true;
+  };
+
   const ingest = (text) => {
+    // Heuristic: comma-separated with a header row → CSV; otherwise treat as pasted statement text.
+    const firstLine = (text.split("\n").find((l) => l.trim()) || "");
+    if (!firstLine.includes(",")) { ingestStatementText(text); return; }
     const res = PapaParse(text);
-    if (!res || !res.data?.length) return;
+    if (!res || !res.data?.length) { ingestStatementText(text); return; }
     const hs = res.meta.fields || Object.keys(res.data[0] || {});
     setHeaders(hs); setRaw(res.data);
     const find = (cands) => hs.find((h) => cands.some((c) => h.toLowerCase().includes(c))) || "";
@@ -1095,6 +1176,13 @@ function ImportModal({ state, addTxns, onClose }) {
   };
 
   useEffect(() => {
+    if (pdfRows) {
+      setPreview(pdfRows.map((r) => {
+        const amount = flipSign ? -r.amount : r.amount;
+        return { id: uid(), date: r.date, description: r.description, amount, account: acct, ...categorize(r.description, amount, state.customRules) };
+      }));
+      return;
+    }
     if (!raw) return;
     const out = raw.map((r) => {
       const dateStr = r[map.date]; const desc = (r[map.desc] || "").toString().trim();
@@ -1109,28 +1197,66 @@ function ImportModal({ state, addTxns, onClose }) {
       return { id: uid(), date: dt.toISOString().slice(0, 10), description: desc, amount, account: acct, ...categorize(desc, amount, state.customRules) };
     }).filter(Boolean);
     setPreview(out);
-  }, [raw, map, twoCol, flipSign, acct]);
+  }, [raw, map, twoCol, flipSign, acct, pdfRows]);
 
   const existingKeys = useMemo(() => new Set(state.transactions.map((t) => t.date + "|" + t.amount.toFixed(2) + "|" + (t.description || "").slice(0, 20))), [state.transactions]);
   const fresh = preview.filter((t) => !existingKeys.has(t.date + "|" + t.amount.toFixed(2) + "|" + (t.description || "").slice(0, 20)));
   const dupes = preview.length - fresh.length;
 
-  const onFile = (e) => { const f = e.target.files?.[0]; if (!f) return; const rd = new FileReader(); rd.onload = () => ingest(rd.result); rd.readAsText(f); };
+  const onFile = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setErrMsg("");
+    if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) {
+      setParsing(true);
+      try {
+        const { extractPdfText } = await import("./pdfImport.js");
+        const text = await extractPdfText(f);
+        ingestStatementText(text);
+      } catch (err) {
+        setErrMsg("Couldn't read that PDF (" + (err?.message || err) + "). Try the CSV download from your bank instead.");
+      }
+      setParsing(false);
+      return;
+    }
+    const rd = new FileReader(); rd.onload = () => ingest(rd.result); rd.readAsText(f);
+  };
 
-  const commit = () => { if (fresh.length) addTxns(fresh); onClose(); };
+  const commit = () => { const n = fresh.length; if (n) addTxns(fresh); if (onDone) onDone(n); else onClose(); };
 
   return (
     <Modal title="Import bank transactions" onClose={onClose}>
-      {!raw ? (
+      {!raw && !pdfRows ? (
         <div>
           <div className="banner info" style={{ marginBottom: 14 }}><Info size={16} style={{ flex: "none", marginTop: 1 }} />
-            <span>Export a CSV from your bank (Chase, Discover, FNBO all offer "Download → CSV"). Drop it here. Nothing is uploaded anywhere — it's parsed right in your browser.</span></div>
+            <span><strong>CSV or PDF statement.</strong> Chase's website offers CSV under the download icon above your transaction list (desktop site) — or just upload the monthly <strong>statement PDF</strong> directly and it'll be parsed here. Nothing is uploaded anywhere; it's all read in your browser.</span></div>
+          {errMsg && <div className="banner warn" style={{ marginBottom: 14 }}><AlertTriangle size={16} style={{ flex: "none", marginTop: 1 }} /><span>{errMsg}</span></div>}
           <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
-            <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onFile} style={{ display: "none" }} />
-            <button className="btn primary" onClick={() => fileRef.current?.click()}><Upload size={15} /> Choose CSV file</button>
-            <span className="note">or paste below</span>
+            <input ref={fileRef} type="file" accept=".csv,.pdf,text/csv,application/pdf" onChange={onFile} style={{ display: "none" }} />
+            <button className="btn primary" disabled={parsing} onClick={() => fileRef.current?.click()}>{parsing ? <><Loader2 size={15} className="spin" /> Reading PDF…</> : <><Upload size={15} /> Choose CSV or PDF</>}</button>
+            <span className="note">or paste CSV / statement text below</span>
           </div>
           <textarea className="inp" style={{ marginTop: 12, minHeight: 120, fontFamily: "ui-monospace,monospace", fontSize: 12 }} placeholder={"Date,Description,Amount\n2026-06-01,King Soopers,-84.20\n2026-06-02,Alma Payout,4200.00"} onChange={(e) => { if (e.target.value.trim().length > 20) ingest(e.target.value); }} />
+        </div>
+      ) : pdfRows ? (
+        <div className="grid" style={{ gap: 14 }}>
+          <div className="banner info"><FileText size={16} style={{ flex: "none", marginTop: 1 }} />
+            <span>Parsed <strong>{pdfRows.length}</strong> transactions from a <strong>{pdfMeta?.kind}</strong>{pdfMeta?.periodLabel ? <> ({pdfMeta.periodLabel})</> : null}.{pdfMeta?.yearAssumed ? " Couldn't detect the statement period, so the current year was assumed — double-check dates below." : ""}{pdfMeta?.generic ? " Layout wasn't recognized as Chase, so amounts default to money-out — use the sign flip if needed." : ""}{pdfMeta?.skipped ? ` ${pdfMeta.skipped} line(s) couldn't be parsed.` : ""}</span></div>
+          <div className="grid two" style={{ gap: 10 }}>
+            <Field label="Assign to account"><select className="inp" value={acct} onChange={(e) => setAcct(e.target.value)}>{state.accounts.map((a) => <option key={a}>{a}</option>)}</select></Field>
+            <Field label="Sign convention"><label className="row" style={{ fontSize: 13, gap: 8, paddingTop: 8 }}><input type="checkbox" checked={flipSign} onChange={(e) => setFlipSign(e.target.checked)} /> Flip +/− (if signs look inverted)</label></Field>
+          </div>
+          <div>
+            <div className="spread" style={{ marginBottom: 6 }}><strong style={{ fontWeight: 600, fontSize: 13 }}>Preview</strong><span className="note">{fresh.length} new{dupes > 0 ? ` · ${dupes} duplicate(s) skipped` : ""}</span></div>
+            <div style={{ maxHeight: 220, overflow: "auto", border: "1px solid var(--line)", borderRadius: 12 }}>
+              <table><thead><tr><th>Date</th><th>Description</th><th>Category</th><th className="num">Amount</th></tr></thead>
+                <tbody>{preview.slice(0, 60).map((t) => <tr key={t.id}><td style={{ whiteSpace: "nowrap", color: "var(--muted)" }}>{t.date}</td><td style={{ maxWidth: 200 }}>{t.description}</td><td><span className="tag">{t.category}</span></td><td className="num" style={{ color: t.amount >= 0 ? "var(--pos)" : "var(--ink)" }}>{money(t.amount, true)}</td></tr>)}</tbody>
+              </table>
+            </div>
+          </div>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <button className="btn ghost" onClick={() => { setPdfRows(null); setPdfMeta(null); setPreview([]); setErrMsg(""); }}>← Start over</button>
+            <button className="btn primary" disabled={!fresh.length} onClick={commit}><Check size={15} /> Import {fresh.length} transactions</button>
+          </div>
         </div>
       ) : (
         <div className="grid" style={{ gap: 14 }}>

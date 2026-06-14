@@ -56,6 +56,12 @@ Without any keys it works immediately in local-only mode, so you can try it firs
 7. First time in, you'll **set up a household**: choose **Create a new household**. You're now synced.
    (If you used local-only mode first, that data is pushed up to your household automatically.)
 
+### f. Make password-reset emails work (1 minute, do this once deployed)
+8. In Supabase: **Authentication -> URL Configuration**. Set **Site URL** to your deployed
+   address (e.g. `https://hearth-xxxx.vercel.app`) and add it under **Redirect URLs** too.
+   This is where the "Forgot password?" email links back to. Without it, reset links
+   point at `localhost:3000` and go nowhere.
+
 ---
 
 ## 3. Deploy it free (Vercel)
@@ -82,6 +88,22 @@ Skip Supabase entirely. Run `npm run build` and drag the **`dist`** folder onto
 **https://app.netlify.com/drop**. Data stays in that browser (no login, no sync).
 
 ---
+
+## Importing transactions (CSV or PDF)
+
+Open **Transactions -> Import**. Two ways in, both parsed entirely in your browser:
+
+- **CSV** — on chase.com (desktop site, not the mobile app), open the account and look for the
+  **download icon** above the transaction list; choose a date range and a spreadsheet/CSV file
+  type. Discover and FNBO have similar "export/download activity" options.
+- **PDF statement** — if all you have is the monthly statement PDF (Chase only offers PDFs in
+  some views), just upload it directly. The importer reads Chase **checking** statements,
+  Chase **credit-card** statements, and Discover summaries, auto-detects the statement period
+  for correct years, and shows a preview before anything is imported. Credit-card *payments*
+  are tagged as transfers automatically so they don't double-count against your checking.
+  (Scanned/image-only PDFs can't be read — use the CSV route for those.)
+
+Duplicates are skipped automatically, so re-importing an overlapping range is safe.
 
 ## Sharing one budget with Shannon (the household model)
 
@@ -129,4 +151,3 @@ hearth-finances/
 
 Built with React + Vite. Backup/restore (a single JSON file) is always available on the
 **Data** tab, in either mode.
-# hearth
