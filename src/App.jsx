@@ -132,7 +132,13 @@ const money = (n, dec = false) => {
   const s = v.toLocaleString("en-US", { minimumFractionDigits: dec ? 2 : 0, maximumFractionDigits: dec ? 2 : 0 });
   return (neg ? "(" : "") + "$" + s + (neg ? ")" : "");
 };
-const monthKey = (d) => { const x = new Date(d); if (isNaN(x)) return ""; return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}`; };
+const monthKey = (d) => {
+  // Parse a stored "YYYY-MM-DD" string directly — never via new Date(), which
+  // treats it as UTC midnight and rolls the 1st of the month back a day in
+  // negative-offset timezones (e.g. Denver), throwing it into the prior month.
+  if (typeof d === "string") { const m = d.match(/^(\d{4})-(\d{2})/); if (m) return `${m[1]}-${m[2]}`; }
+  const x = new Date(d); if (isNaN(x)) return ""; return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}`;
+};
 const monthLabel = (k) => { if (!k) return ""; const [y, m] = k.split("-"); return new Date(+y, +m - 1, 1).toLocaleDateString("en-US", { month: "short", year: "2-digit" }); };
 const parseAmount = (s) => { if (typeof s === "number") return s; if (!s) return NaN; let t = String(s).trim().replace(/[$,\s]/g, ""); if (/^\(.*\)$/.test(t)) t = "-" + t.replace(/[()]/g, ""); return parseFloat(t); };
 
@@ -163,7 +169,7 @@ const RULES = [
   { re: /allen services|plumb|hvac|home depot|lowe'?s|ace hardware|handyman|roofing/i, flow: "expense", g: "Housing & Utilities", c: "Home / repairs" },
   // debt service
   { re: /discover.*(e-?payment|payment)|disc\s*e-?pay/i, flow: "expense", g: "Debt service", c: "Discover payment" },
-  { re: /chase (credit crd|card).*(autopay|epay|payment)|cardmember serv|card payment|crd\s*autopay/i, flow: "expense", g: "Debt service", c: "Credit card payment" },
+  { re: /chase (credit crd|card).*(autopay|epay|payment)|payment to .*card|cardmember serv|card payment|crd\s*autopay/i, flow: "expense", g: "Debt service", c: "Credit card payment" },
   { re: /\bciti\b|citibank|bank of america|\bboa\b|capital one|amex|american express|synchrony|barclay/i, flow: "expense", g: "Debt service", c: "Credit card payment" },
   { re: /loan pmt|loanpmt|installment|sofi|upstart|lendingclub/i, flow: "expense", g: "Debt service", c: "Loan payment" },
   // practice / business
@@ -199,26 +205,35 @@ const RULES = [
   { re: /online transfer|transfer to|transfer from|to savings|from savings|\bfnbo\b|to sav |xfer/i, flow: "transfer", g: "Transfers & Savings", c: "Transfer" },
 ];
 
+/* Infer business vs personal from the category group when a rule doesn't say. */
+const BIZ_BY_GROUP = {
+  "Income — Practice": "Business", "Practice / Business": "Business",
+  "Groceries & Household": "Personal", "Dining & Coffee": "Personal", "Kids & Activities": "Personal",
+  "Health & Medical": "Personal", "Personal Care": "Personal", "Shopping & Retail": "Personal",
+  "Subscriptions": "Personal", "Donations": "Personal",
+};
+const bizForGroup = (g) => BIZ_BY_GROUP[g] || "Mixed";
+
 function categorize(desc, amount, customRules = []) {
   const d = desc || "";
   const dl = d.toLowerCase();
   // user-taught rules win over built-ins
   for (const r of (customRules || [])) {
     if (r.match && dl.includes(r.match)) {
-      return { flow: r.flow || (amount >= 0 ? "income" : "expense"), group: r.group, category: r.category, biz: r.biz || "Mixed" };
+      return { flow: r.flow || (amount >= 0 ? "income" : "expense"), group: r.group, category: r.category, biz: r.biz || bizForGroup(r.group) };
     }
   }
   for (const r of RULES) {
     if (r.re.test(d)) {
       if (r.flow === "auto") {
-        if (amount >= 0) return { flow: "income", group: r.g, category: r.c, biz: r.biz || "Mixed" };
-        return { flow: "expense", group: r.expG, category: r.expC, biz: r.biz || "Mixed" };
+        if (amount >= 0) return { flow: "income", group: r.g, category: r.c, biz: r.biz || bizForGroup(r.g) };
+        return { flow: "expense", group: r.expG, category: r.expC, biz: r.biz || bizForGroup(r.expG) };
       }
       // sign sanity: a positive amount tagged as an expense-fee is really income
       if (amount > 0 && r.flow === "expense" && /fee|return|refund/i.test(r.c)) {
         return { flow: "income", group: "Income — Other", category: "Refund / return", biz: "Mixed" };
       }
-      return { flow: r.flow, group: r.g, category: r.c, biz: r.biz || (r.flow === "income" ? "Business" : "Mixed") };
+      return { flow: r.flow, group: r.g, category: r.c, biz: r.biz || bizForGroup(r.g) };
     }
   }
   if (amount > 0) return { flow: "income", group: "Income — Other", category: "Uncategorized income", biz: "Mixed" };
@@ -313,7 +328,7 @@ const SEED_GOALS = [
 ];
 
 const DEFAULT_STATE = {
-  v: 2, transactions: [], budgets: { ...SEED_BUDGETS }, debts: SEED_DEBTS, goals: SEED_GOALS,
+  v: 2, transactions: [], imports: [], budgets: { ...SEED_BUDGETS }, debts: SEED_DEBTS, goals: SEED_GOALS,
   accounts: ["Chase Checking ••3217", "Chase Sapphire ••8618", "Discover ••1908", "Cole — personal"],
   customRules: [],
 };
@@ -501,6 +516,13 @@ function AppShell({ session, localOnly, household, onHouseholdChange }) {
   /* mutators */
   const patch = (p) => setState((s) => ({ ...s, ...p }));
   const addTxns = (rows) => setState((s) => ({ ...s, transactions: [...s.transactions, ...rows] }));
+  const importBatch = (rows, meta = {}) => setState((s) => {
+    const id = uid();
+    const tagged = rows.map((r) => ({ ...r, imp: id }));
+    const rec = { id, when: new Date().toISOString(), count: rows.length, label: meta.label || "Import", account: meta.account || "", source: meta.source || "csv" };
+    return { ...s, transactions: [...s.transactions, ...tagged], imports: [...(s.imports || []), rec] };
+  });
+  const deleteImport = (id) => setState((s) => ({ ...s, transactions: s.transactions.filter((t) => t.imp !== id), imports: (s.imports || []).filter((r) => r.id !== id) }));
   const updateTxn = (id, p) => setState((s) => ({ ...s, transactions: s.transactions.map((t) => t.id === id ? { ...t, ...p } : t) }));
   const delTxn = (id) => setState((s) => ({ ...s, transactions: s.transactions.filter((t) => t.id !== id) }));
   const applyCategorization = ({ txnId, cat, rule, applyExisting }) => setState((s) => {
@@ -562,11 +584,11 @@ function AppShell({ session, localOnly, household, onHouseholdChange }) {
 
       <div className="wrap">
         {tab === "dash" && <Dashboard state={state} month={month} months={months} />}
-        {tab === "txns" && <Transactions state={state} addTxns={addTxns} updateTxn={updateTxn} delTxn={delTxn} applyCategorization={applyCategorization} />}
+        {tab === "txns" && <Transactions state={state} addTxns={addTxns} importBatch={importBatch} updateTxn={updateTxn} delTxn={delTxn} applyCategorization={applyCategorization} />}
         {tab === "budget" && <Budgets state={state} month={month} patch={patch} />}
         {tab === "goals" && <Goals state={state} patch={patch} />}
         {tab === "debts" && <Debts state={state} patch={patch} />}
-        {tab === "data" && <DataTab state={state} setState={setState} addTxns={addTxns} deleteRule={deleteRule} household={household} onHouseholdChange={onHouseholdChange} session={session} localOnly={localOnly} />}
+        {tab === "data" && <DataTab state={state} setState={setState} addTxns={addTxns} importBatch={importBatch} deleteImport={deleteImport} deleteRule={deleteRule} household={household} onHouseholdChange={onHouseholdChange} session={session} localOnly={localOnly} />}
       </div>
     </div>
   );
@@ -947,7 +969,7 @@ function EmptyDash() {
 }
 
 /* ============================================================ TRANSACTIONS */
-function Transactions({ state, addTxns, updateTxn, delTxn, applyCategorization }) {
+function Transactions({ state, addTxns, importBatch, updateTxn, delTxn, applyCategorization }) {
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("");
   const [adding, setAdding] = useState(false);
@@ -1010,7 +1032,7 @@ function Transactions({ state, addTxns, updateTxn, delTxn, applyCategorization }
         )}
       </Card>
 
-      {importing && <ImportModal state={state} addTxns={addTxns} onClose={() => setImporting(false)} onDone={(n) => { setImporting(false); setNotice(`Imported ${n} transaction${n === 1 ? "" : "s"}.`); window.scrollTo({ top: 0, behavior: "smooth" }); }} />}
+      {importing && <ImportModal state={state} addTxns={addTxns} importBatch={importBatch} onClose={() => setImporting(false)} onDone={(n) => { setImporting(false); setNotice(`Imported ${n} transaction${n === 1 ? "" : "s"}.`); window.scrollTo({ top: 0, behavior: "smooth" }); }} />}
       {adding && <AddTxnModal state={state} addTxns={addTxns} onClose={() => setAdding(false)} />}
       {categorizing && <CategorizeModal txn={categorizing} state={state} onApply={applyCategorization} onClose={() => setCategorizing(null)} />}
     </div>
@@ -1135,7 +1157,7 @@ function CategorizeModal({ txn, state, onApply, onClose }) {
 }
 
 /* ---------- CSV IMPORT ---------- */
-function ImportModal({ state, addTxns, onClose, onDone }) {
+function ImportModal({ state, addTxns, importBatch, onClose, onDone }) {
   const [raw, setRaw] = useState(null);
   const [headers, setHeaders] = useState([]);
   const [map, setMap] = useState({ date: "", desc: "", amount: "", debit: "", credit: "" });
@@ -1146,6 +1168,7 @@ function ImportModal({ state, addTxns, onClose, onDone }) {
   const [pdfRows, setPdfRows] = useState(null);
   const [pdfMeta, setPdfMeta] = useState(null);
   const [parsing, setParsing] = useState(false);
+  const [srcLabel, setSrcLabel] = useState("");
   const [errMsg, setErrMsg] = useState("");
   const fileRef = useRef(null);
 
@@ -1164,7 +1187,9 @@ function ImportModal({ state, addTxns, onClose, onDone }) {
     if (!res || !res.data?.length) { ingestStatementText(text); return; }
     const hs = res.meta.fields || Object.keys(res.data[0] || {});
     setHeaders(hs); setRaw(res.data);
-    const find = (cands) => hs.find((h) => cands.some((c) => h.toLowerCase().includes(c))) || "";
+    // Match by candidate PRIORITY (not column order), so a real "Description"
+    // column always wins over Chase's "Details" (DEBIT/CREDIT) column.
+    const find = (cands) => { for (const c of cands) { const h = hs.find((x) => x.toLowerCase().includes(c)); if (h) return h; } return ""; };
     const dCol = find(["date", "posting"]);
     const descCol = find(["description", "payee", "name", "memo", "merchant", "details"]);
     const amtCol = find(["amount", "value"]);
@@ -1185,7 +1210,7 @@ function ImportModal({ state, addTxns, onClose, onDone }) {
     }
     if (!raw) return;
     const out = raw.map((r) => {
-      const dateStr = r[map.date]; const desc = (r[map.desc] || "").toString().trim();
+      const dateStr = r[map.date]; const desc = (r[map.desc] || "").toString().replace(/\s+/g, " ").trim();
       let amount;
       if (twoCol) {
         const deb = parseAmount(r[map.debit]); const cred = parseAmount(r[map.credit]);
@@ -1205,7 +1230,7 @@ function ImportModal({ state, addTxns, onClose, onDone }) {
 
   const onFile = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
-    setErrMsg("");
+    setErrMsg(""); setSrcLabel(f.name);
     if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) {
       setParsing(true);
       try {
@@ -1221,7 +1246,7 @@ function ImportModal({ state, addTxns, onClose, onDone }) {
     const rd = new FileReader(); rd.onload = () => ingest(rd.result); rd.readAsText(f);
   };
 
-  const commit = () => { const n = fresh.length; if (n) addTxns(fresh); if (onDone) onDone(n); else onClose(); };
+  const commit = () => { const n = fresh.length; if (n) importBatch(fresh, { label: srcLabel || (pdfRows ? (pdfMeta?.kind || "PDF statement") : "CSV import"), account: acct, source: pdfRows ? "pdf" : (raw ? "csv" : "paste") }); if (onDone) onDone(n); else onClose(); };
 
   return (
     <Modal title="Import bank transactions" onClose={onClose}>
@@ -1598,7 +1623,7 @@ function DebtModal({ debt, state, onSave, onClose }) {
 }
 
 /* ============================================================ DATA TAB */
-function DataTab({ state, setState, addTxns, deleteRule, household, onHouseholdChange, session, localOnly }) {
+function DataTab({ state, setState, addTxns, importBatch, deleteImport, deleteRule, household, onHouseholdChange, session, localOnly }) {
   const fileRef = useRef(null);
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1612,7 +1637,7 @@ function DataTab({ state, setState, addTxns, deleteRule, household, onHouseholdC
     rd.onload = () => { try { const obj = JSON.parse(rd.result); if (obj.transactions) { setState(obj); setMsg("Restored from backup."); } } catch (err) { setMsg("Couldn't read that file."); } };
     rd.readAsText(f);
   };
-  const loadDemo = () => { addTxns(makeDemo()); setMsg("Loaded ~2 months of demo transactions. Clear them anytime."); };
+  const loadDemo = () => { importBatch(makeDemo(), { label: "Demo data", account: "—", source: "demo" }); setMsg("Loaded ~2 months of demo transactions. Delete them anytime from Uploads below."); };
   const clearTxns = () => { if (confirm("Delete all transactions? Your budgets, debts, and goals stay.")) setState({ ...state, transactions: [] }); };
   const resetAll = () => { if (confirm("Reset EVERYTHING back to defaults? This wipes the budget" + (household ? " for everyone in this household." : " on this device."))) setState(DEFAULT_STATE); };
   const addAccount = () => { const n = prompt("Account name (e.g. 'Chase Checking ••1234')"); if (n) setState({ ...state, accounts: [...state.accounts, n] }); };
@@ -1684,6 +1709,39 @@ function DataTab({ state, setState, addTxns, deleteRule, household, onHouseholdC
           <button className="btn danger" onClick={resetAll}><AlertTriangle size={15} /> Reset everything</button>
         </Card>
       </div>
+
+      <Card className="pad" style={{ marginTop: 14 }}>
+        <div className="spread" style={{ marginBottom: 10 }}>
+          <div className="row" style={{ gap: 9 }}><Upload size={17} style={{ color: "var(--green2)" }} /><strong style={{ fontWeight: 600 }}>Uploads</strong></div>
+          <span className="note">{(state.imports || []).length} import{(state.imports || []).length === 1 ? "" : "s"}</span>
+        </div>
+        {(state.imports || []).length === 0 ? (
+          <div className="note" style={{ lineHeight: 1.6 }}>Each CSV or PDF you import is tracked here as a batch. If you import the wrong file or mislabel an account, delete the whole batch in one click and re-import — no starting over. (Transactions imported before this update aren't grouped into a batch.)</div>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>Imported</th><th>Source</th><th>Account</th><th className="num">Rows still present</th><th></th></tr></thead>
+              <tbody>
+                {[...(state.imports || [])].sort((a, b) => (a.when < b.when ? 1 : -1)).map((r) => {
+                  const live = state.transactions.filter((t) => t.imp === r.id).length;
+                  const when = new Date(r.when);
+                  const dstr = isNaN(when) ? "" : when.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + " " + when.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+                  return (
+                    <tr key={r.id}>
+                      <td><div style={{ fontWeight: 500, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</div><div className="note">{dstr}</div></td>
+                      <td><span className="tag">{r.source}</span></td>
+                      <td className="note" style={{ whiteSpace: "nowrap" }}>{(r.account || "—").replace("••", "·")}</td>
+                      <td className="num">{live}{live !== r.count ? <span className="note"> / {r.count}</span> : ""}</td>
+                      <td className="num"><button className="btn danger sm" onClick={() => { if (confirm(`Delete this import and its ${live} remaining transaction${live === 1 ? "" : "s"}? Your budgets, debts, goals, and other imports stay.`)) { deleteImport(r.id); setMsg(`Removed "${r.label}" (${live} transaction${live === 1 ? "" : "s"}).`); } }}><Trash2 size={13} /> Delete</button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <div className="note" style={{ marginTop: 10, lineHeight: 1.5 }}>"Rows still present" can be lower than the original count if you deleted individual transactions or they were skipped as duplicates. Deleting a batch removes only the transactions that came from it.</div>
+          </div>
+        )}
+      </Card>
 
       <Card className="pad" style={{ marginTop: 14 }}>
         <div className="spread" style={{ marginBottom: 10 }}>
